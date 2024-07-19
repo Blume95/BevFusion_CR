@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 from torchvision.models.resnet import resnet18
-from data.vod_dataset import dataloaders
 from torch.distributed import init_process_group, destroy_process_group
 import os
 from tqdm import tqdm
@@ -206,52 +205,5 @@ def ddp_setup(rank: int, world_size: int):
     init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
 
-def main(rank: int, world_size: int):
-    from data.vod_dataset import dataloaders
-    from tools.tool import SimpleLoss
-    loss_fn = SimpleLoss(pos_weight=4).to(rank)
-    final_hw = (128, 256)
-    org_hw = (1216, 1936)
-
-    xbound = [-20.0, 20.0, 0.1]
-    ybound = [-10.0, 10.0, 20.0]
-    zbound = [0, 40.0, 0.1]
-    dbound = [3.0, 43.0, 1.0]
-    grid = {
-        'xbound': xbound,
-        'ybound': ybound,
-        'zbound': zbound,
-        'dbound': dbound,
-    }
-    path = "/home/jing/Downloads/view_of_delft_PUBLIC/"
-    data_aug_conf = {
-        'resize_lim': (0.3, 0.36),
-        'final_dim': final_hw,
-        'rot_lim': (-5.4, 5.4),
-        'H': org_hw[0], 'W': org_hw[1],
-        'rand_flip': True,
-        'bot_pct_lim': (0.0, 0.1)
-    }
-
-    ddp_setup(rank, world_size)
-    train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=4, batch_size=12,
-                                           data_aug_conf=data_aug_conf)
-    model = LiftSplatShoot(org_fhw=final_hw, grid_conf=grid, outC=4, sensor_type="fusion", camC=64, radarC=3)
-    model.to(rank)
-    model = DDP(model, device_ids=[rank])
-    model.eval()
-
-    if rank == 0:
-        for img, extrinsic, intrinsic, post_rot, post_tran, gt_binimg, radar_bev in tqdm(train_loader):
-            train_loader.sampler.set_epoch(0)
-            preds = model(img.to(rank), intrinsic.to(rank), post_rot.to(rank), post_tran.to(rank),
-                          radar_bev.to(rank))
-
-            break
-
-    destroy_process_group()
-
-
 if __name__ == "__main__":
     world_size = torch.cuda.device_count()
-    mp.spawn(main, nprocs=world_size, args=(world_size,))
