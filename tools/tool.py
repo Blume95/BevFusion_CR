@@ -56,19 +56,18 @@ class SimpleLoss(torch.nn.Module):
         return loss
 
 
-
-def get_val_info(model, valloader, loss_fn, device, use_tqdm=True, fusion_threshold=0.3):
+def get_val_info(model, val_loader, loss_fn, device, use_tqdm=True):
     model.eval()
     print('running eval...')
     total_intersect = 0
     total_union = 0
     total_loss = 0.0
-    loader = tqdm(valloader) if use_tqdm else valloader
+    loader = tqdm(val_loader) if use_tqdm else val_loader
     with torch.no_grad():
         for batch in loader:
             img_, extrinsic_, intrinsic_, post_rot_, post_tran_, gt_binimg_, radar_bev = batch
             preds = model(img_.to(device), intrinsic_.to(device), post_rot_.to(device), post_tran_.to(device),
-                          radar_bev.to(device), fusion_threshold, False)
+                          radar_bev.to(device))
             gt_binimg_ = gt_binimg_.to(device)
 
             # loss
@@ -80,7 +79,7 @@ def get_val_info(model, valloader, loss_fn, device, use_tqdm=True, fusion_thresh
             total_intersect += (pred & tgt).sum().float().item()
             total_union += (pred | tgt).sum().float().item()
         return {
-            'loss': total_loss / len(valloader.dataset),
+            'loss': total_loss / len(val_loader.dataset),
             'iou': total_intersect / total_union,
         }
 
@@ -92,39 +91,6 @@ def ddp_setup(rank: int, world_size: int):
     init_process_group(backend='nccl', rank=rank, world_size=world_size)
 
 
-def main(rank: int, world_size: int):
-    from my_dataset import dataloaders
-    from model import LiftSplatShoot
-    loss_fn = CenterLoss()
-    final_hw = (128, 256)
-    org_hw = (1216, 1936)
-
-    xbound = [-20.0, 20.0, 0.1]
-    ybound = [-10.0, 10.0, 20.0]
-    zbound = [0, 40.0, 0.1]
-    dbound = [3.0, 43.0, 1.0]
-    grid = {
-        'xbound': xbound,
-        'ybound': ybound,
-        'zbound': zbound,
-        'dbound': dbound,
-    }
-    path = "/home/jing/Downloads/view_of_delft_PUBLIC/"
-    print(rank)
-
-    ddp_setup(rank, world_size)
-    train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=4, batch_size=2,
-                                           detection_flag=1)
-    model = LiftSplatShoot(org_fhw=final_hw, grid_conf=grid, outC=4, sensor_type="fusion", camC=64, radarC=3)
-    model.to(rank)
-    model = DDP(model, device_ids=[rank])
-    if rank == 0:
-        print(get_val_info(model, val_loader, loss_fn, rank, detection_flag=1))
-
-    destroy_process_group()
-
-
 if __name__ == "__main__":
     world_size = torch.cuda.device_count()
     print(world_size)
-    mp.spawn(main, nprocs=world_size, args=(world_size,))

@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from efficientnet_pytorch import EfficientNet
 from torchvision.models.resnet import resnet18
 from data.vod_dataset import dataloaders
 from torch.distributed import init_process_group, destroy_process_group
@@ -9,6 +8,9 @@ from tqdm import tqdm
 
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from model.up_conv import Up
+from model.camera_encoder import getCamEncoder
+
 
 def cumsum_trick(x, geom_feats, ranks):
     x = x.cumsum(0)
@@ -51,18 +53,19 @@ class QuickCumsum(torch.autograd.Function):
 
 
 class LiftSplatShoot(nn.Module):
-    def __init__(self, org_fhw: tuple, grid_conf: dict, outC: int, sensor_type: str, camC: int, radarC: int):
+    def __init__(self, org_fhw: tuple, grid_conf: dict, outC: int, sensor_type: str, camC: int, radarC: int,
+                 net_name='convnext'):
         super(LiftSplatShoot, self).__init__()
         self.org_fhw = org_fhw
         self.grid_conf = grid_conf
-        self.downsample = 8
+        self.downsample = 16
         self.frustum = self.create_frustum_1camera()
         self.camC = camC
         self.radarC = radarC
         self.sensor_type = sensor_type
         self.D, _, _, _ = self.frustum.shape
 
-        self.camencode = CamEncode(self.D, self.camC)
+        self.camencode = getCamEncoder(self.D, self.camC, net_name=net_name)
         self.bevencode = BevEncode(inC=self.camC + self.radarC, outC=outC)
 
         self.nx = torch.LongTensor([(row[1] - row[0]) / row[2] for row in [self.grid_conf['xbound'],
@@ -163,70 +166,6 @@ class LiftSplatShoot(nn.Module):
         return x
 
 
-class Up(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, scale_factor: int = 2):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        x1 = self.up(x1)
-        x1 = torch.cat([x2, x1], dim=1)
-        return self.conv(x1)
-
-
-class CamEncode(nn.Module):
-    def __init__(self, D: int, C: int):
-        super(CamEncode, self).__init__()
-        self.D = D
-        self.C = C
-        self.trunk = EfficientNet.from_pretrained("efficientnet-b3")
-        self.up1 = Up(320 + 112, 512)
-        self.depthnet = nn.Conv2d(512, self.D + self.C, kernel_size=1, padding=0)
-
-    def get_depth_dist(self, x: torch.Tensor, eps: float = 1e-20) -> torch.Tensor:
-        return x.softmax(dim=1)
-
-    def get_depth_feat(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.get_eff_depth(x)
-        x = self.depthnet(x)
-        depth = self.get_depth_dist(x[:, :self.D])
-        new_x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
-        return new_x
-
-    def get_eff_depth(self, x: torch.Tensor) -> torch.Tensor:
-        endpoints = dict()
-        x = self.trunk._swish(self.trunk._bn0(self.trunk._conv_stem(x)))
-        print(x.shape)
-        prev_x = x
-
-        for idx, block in enumerate(self.trunk._blocks):
-            drop_connect_rate = self.trunk._global_params.drop_connect_rate
-            if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self.trunk._blocks)
-            x = block(x, drop_connect_rate=drop_connect_rate)
-            print(x.shape)
-            if prev_x.size(2) > x.size(2):
-                endpoints[f'reduction_{len(endpoints) + 1}'] = prev_x
-            prev_x = x
-
-        endpoints[f'reduction_{len(endpoints) + 1}'] = x
-        x = self.up1(endpoints['reduction_5'], endpoints['reduction_4'])
-        return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x batch , 3 , h, w
-        x = self.get_depth_feat(x)
-        return x
-
-
 class BevEncode(nn.Module):
     def __init__(self, inC: int, outC: int):
         super(BevEncode, self).__init__()
@@ -295,13 +234,14 @@ def main(rank: int, world_size: int):
     }
 
     ddp_setup(rank, world_size)
-    train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=4, batch_size=12,data_aug_conf=data_aug_conf)
+    train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=4, batch_size=12,
+                                           data_aug_conf=data_aug_conf)
     model = LiftSplatShoot(org_fhw=final_hw, grid_conf=grid, outC=4, sensor_type="fusion", camC=64, radarC=3)
     model.to(rank)
     model = DDP(model, device_ids=[rank])
     model.eval()
 
-    if rank ==0:
+    if rank == 0:
         for img, extrinsic, intrinsic, post_rot, post_tran, gt_binimg, radar_bev in tqdm(train_loader):
             train_loader.sampler.set_epoch(0)
             preds = model(img.to(rank), intrinsic.to(rank), post_rot.to(rank), post_tran.to(rank),
@@ -309,13 +249,9 @@ def main(rank: int, world_size: int):
 
             break
 
-
     destroy_process_group()
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     world_size = torch.cuda.device_count()
     mp.spawn(main, nprocs=world_size, args=(world_size,))
-
-
-

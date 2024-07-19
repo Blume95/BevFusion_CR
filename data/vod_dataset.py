@@ -308,7 +308,7 @@ def dataloaders(path, grid, final_hw, org_hw, nworkers, batch_size, data_aug_con
         sampler=DistributedSampler(train_data), drop_last=True
     )
     val_loader = torch.utils.data.DataLoader(
-        val_data, batch_size=batch_size, shuffle=False, num_workers=nworkers, sampler=DistributedSampler(val_data)
+        val_data, batch_size=batch_size, shuffle=False, num_workers=nworkers
     )
 
     return train_loader, val_loader

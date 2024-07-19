@@ -22,7 +22,11 @@ class CustomConvNeXt(nn.Module):
             original_model.features[0],  # First block
             original_model.features[1],  # Second block
             original_model.features[2],
-            original_model.features[3]
+            original_model.features[3],
+            original_model.features[4],
+            original_model.features[5],
+            original_model.features[6],
+            original_model.features[7]
 
         )
         print(self.part1)
