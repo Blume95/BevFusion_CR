@@ -235,7 +235,7 @@ class VodData(Dataset):
         ])
         img = normalize_img(img)
 
-        return img, extrinsic, intrinsic_rot, post_rot, post_tran
+        return img, extrinsic, intrinsic_rot, post_rot, post_tran, img_name
 
     def get_radar_data(self, frame_num):
         radar_name = os.path.join(self.radar_data_dir, f"{frame_num}.bin")
@@ -290,11 +290,11 @@ class VodData(Dataset):
 
     def __getitem__(self, item):
         frame_number = self.frame_numbers[item]
-        img, extrinsic, intrinsic, post_rot, post_tran = self.get_img_data(frame_number)
+        img, extrinsic, intrinsic, post_rot, post_tran, img_name = self.get_img_data(frame_number)
         radar_bev = self.get_radar_data(frame_number)
         gt_binimg = self.generate_binimg(frame_number)
 
-        return img, extrinsic, intrinsic, post_rot, post_tran, gt_binimg, radar_bev
+        return img, extrinsic, intrinsic, post_rot, post_tran, gt_binimg, radar_bev, img_name
 
 
 def dataloaders(path, grid, final_hw, org_hw, nworkers, batch_size, data_aug_conf):
