@@ -50,7 +50,7 @@ def train(rank: int,
     counter = 0
     experiment_name = datetime_now
 
-    loss_fn = SimpleLoss(pos_weight=10).to(rank)
+    loss_fn = SimpleLoss(pos_weight=4).to(rank)
 
     if rank == 0:
         logdir = './runs'
@@ -133,7 +133,7 @@ def main():
     world_size = torch.cuda.device_count()
 
     out_channel = 1
-    fusion_type = "camera"
+    fusion_type = "fusion"
     if fusion_type == "fusion":
         cam_channel = 64
         radar_channel = 3
@@ -153,7 +153,7 @@ def main():
         "workers": 4,
         "lr": 1e-4,
         "weight_decay": 1e-5,
-        "nepochs": 100,
+        "nepochs": 200,
         "val_step": 300,
         "data_aug_conf": data_aug_conf,
         "grid": grid,

@@ -202,9 +202,9 @@ class VodData(Dataset):
             max_v = np.max(radar_features[:, :, c])
             min_v = np.min(radar_features[:, :, c])
             rand_v = np.random.random((H, W))
-            noise_v = rand_v * (max_v - min_v)
             mask = rand_v <= threshold
-            noise_v[mask] = 0
+            noise_v = np.ones_like(rand_v) * (max_v - min_v)
+            noise_v[mask] = 0.0
             radar_features[:, :, c] += noise_v
 
         return radar_features
@@ -243,7 +243,8 @@ class VodData(Dataset):
         scan = np.fromfile(radar_name, dtype=np.float32).reshape(-1, 7)
         points, features = scan[:, :3], scan[:, 3:6]
         points = np.concatenate([points, np.ones((points.shape[0], 1))], axis=1)
-        points = np.dot(extrinsic, points.T).T
+        # points = np.dot(extrinsic, points.T).T
+        points = extrinsic.dot(points.T).T
         points = points[:, :3] / points[:, 3].reshape(-1, 1)
 
         input_scan = np.concatenate([points, features], axis=1)
@@ -251,8 +252,8 @@ class VodData(Dataset):
             input_scan.shape[1], self.grid_conf['xbound'], self.grid_conf['ybound'], self.grid_conf['zbound'],
             input_scan
         )
-        if self.is_train:
-            radar_features = self.radar_augmentation(radar_features, threshold=0.8)
+        # if self.is_train and np.random.rand(1) < 0.9:
+        #     radar_features = self.radar_augmentation(radar_features, threshold=0.9)
         return radar_features
 
     def generate_binimg(self, frame_num):
@@ -315,7 +316,6 @@ def dataloaders(path, grid, final_hw, org_hw, nworkers, batch_size, data_aug_con
 
 
 if __name__ == "__main__":
-
     path = "/home/jing/Downloads/view_of_delft_PUBLIC/"
     xbound = [-10.0, 10.0, 0.1]
     ybound = [-10.0, 10.0, 20.0]

@@ -154,8 +154,7 @@ class LiftSplatShoot(nn.Module):
             radar_bev = radar_bev.permute(0, 3, 1, 2)
             x = torch.cat((x, radar_bev), 1)
         elif self.sensor_type == "radar":
-            radar_bev = radar_bev.permute(0, 3, 1, 2)
-            x = radar_bev
+            x = radar_bev.permute(0, 3, 1, 2)
         elif self.sensor_type == "camera":
             x = self.get_voxels(x, intrins, post_rots, post_trans)
         else:
