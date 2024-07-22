@@ -1,14 +1,11 @@
 import torch
 from torch import nn
 from torchvision.models.resnet import resnet18
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group
 import os
-from tqdm import tqdm
-
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 from model.up_conv import Up
 from model.camera_encoder import getCamEncoder
+import cv2
 
 
 def cumsum_trick(x, geom_feats, ranks):
@@ -83,6 +80,31 @@ class LiftSplatShoot(nn.Module):
 
         self.use_quickcumsum = True
 
+    def normalazation(self, x):
+        C, H, W = x.shape
+        x = x.view(C, -1)
+        return ((x - torch.min(x, dim=1).values.view(-1,1)) / (torch.max(x, dim=1).values - torch.min(x, dim=1).values).view(-1,1)).view(C,H,W)
+
+    def get_vis_feats(self, x, radar, fusion, img_names):
+        B, C, H, W = x.shape
+        for b in range(B):
+            img_name = img_names[b]
+
+            x_i = self.normalazation(torch.abs(x[b]))
+            radar_i = self.normalazation(torch.abs(radar[b]))
+            fusion_i = self.normalazation(torch.abs(fusion[b]))
+            # print(x_i.shape, radar_i.shape, fusion_i.shape)
+
+            x_i_feat = torch.mean(x_i, dim=0)
+            radar_i_feat = torch.mean(radar_i, dim=0)
+            fusion_i_feat = torch.mean(fusion_i, dim=0)
+
+            # print(x_i_feat.shape, radar_i_feat.shape, fusion_i_feat.shape)
+            out = torch.cat((x_i_feat, radar_i_feat, fusion_i_feat), dim=1)
+            out = out * 255
+            out = out.cpu().numpy()
+            cv2.imwrite(f"/home/jing/Downloads/BevFusion_CR/feat_vis/{img_name.split('/')[-1]}", out)
+
     def create_frustum_1camera(self) -> nn.Parameter:
         ogfH, ogfW = self.org_fhw
         fH, fW = ogfH // self.downsample, ogfW // self.downsample
@@ -148,11 +170,14 @@ class LiftSplatShoot(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
-                radar_bev: torch.Tensor) -> torch.Tensor:
+                radar_bev: torch.Tensor, image_name: str) -> torch.Tensor:
         if self.sensor_type == "fusion":
             x = self.get_voxels(x, intrins, post_rots, post_trans)
+            tem = {"tem": x}
             radar_bev = radar_bev.permute(0, 3, 1, 2)
             x = torch.cat((x, radar_bev), 1)
+
+            self.get_vis_feats(tem['tem'], radar_bev, x, image_name)
         elif self.sensor_type == "radar":
             x = radar_bev.permute(0, 3, 1, 2)
         elif self.sensor_type == "camera":
