@@ -103,7 +103,7 @@ class LiftSplatShoot(nn.Module):
             out = torch.cat((x_i_feat, radar_i_feat, fusion_i_feat), dim=1)
             out = out * 255
             out = out.cpu().numpy()
-            cv2.imwrite(f"/home/jing/Downloads/BevFusion_CR/feat_vis/{img_name.split('/')[-1]}", out)
+            cv2.imwrite(f"/home/jing/Downloads/bev_result/feat_vis/{img_name.split('/')[-1]}", out)
 
     def create_frustum_1camera(self) -> nn.Parameter:
         ogfH, ogfW = self.org_fhw

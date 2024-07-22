@@ -92,7 +92,7 @@ def vis(parameters):
                            camC=cam_channel, radarC=radar_channel, net_name=net_name)
 
     model.load_state_dict(
-        torch.load("/home/jing/Downloads/BevFusion_CR/weights/model_21900.pt", map_location=device))
+        torch.load("/home/jing/Downloads/bev_result/weights/model_2400.pt", map_location=device))
     model.to(device)
     model.eval()
     total_intersect = 0
@@ -160,7 +160,7 @@ def vis(parameters):
                 show_img = np.concatenate([show_img, bev_view], axis=1)
                 # show_img = np.moveaxis(show_img, 0, -1)
 
-                cv2.imwrite("/home/jing/Downloads/BevFusion_CR/vis/" + f'{image_name[i].split("/")[-1]}',
+                cv2.imwrite("/home/jing/Downloads/bev_result/vis/" + f'{image_name[i].split("/")[-1]}',
                             show_img)
 
 
