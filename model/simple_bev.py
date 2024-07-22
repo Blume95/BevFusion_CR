@@ -19,6 +19,7 @@ def bilinear_sampling(image, grid):
     grid = grid.view(B, Z * X, 2)
     grid = 2.0 * grid - 1.0  # assuming grid values are in [0, 1]
     grid = grid.view(B, Z, X, 2)
+    print(grid)
 
     # Perform bilinear sampling
     bev_features = F.grid_sample(image, grid, align_corners=True)
@@ -44,6 +45,7 @@ def create_sampling_grid(K, T, Z, X, bev_resolution, bev_start_position):
     # Create 3D grid coordinates
     z_range = torch.arange(0, Z * bev_resolution[0], bev_resolution[0]) + bev_start_position[0]
     x_range = torch.arange(0, X * bev_resolution[1], bev_resolution[1]) + bev_start_position[1]
+    print(z_range)
     z, x = torch.meshgrid(z_range, x_range)
     ones = torch.ones_like(z)
     grid_3d = torch.stack([x, ones, z, ones], dim=-1).view(-1, 4).T  # Shape: (4, Z*X)
@@ -75,6 +77,7 @@ K = torch.tensor([[1000, 0, W / 2], [0, 1000, H / 2], [0, 0, 1]])  # Example int
 T = torch.eye(4)  # Example transformation matrix
 
 grid = create_sampling_grid(K, T, Z, X, bev_resolution, bev_start_position)
+# print(grid)
 bev_features = bilinear_sampling(image, grid)
 
 print(bev_features.shape)  # Should be (B, C, Z, X)

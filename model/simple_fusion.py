@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from model.up_conv import Up
 from model.camera_encoder import getCamEncoder
+import torch.nn.functional as F
 
 
 def cumsum_trick(x, geom_feats, ranks):
@@ -53,7 +54,7 @@ class QuickCumsum(torch.autograd.Function):
 
 class LiftSplatShoot(nn.Module):
     def __init__(self, org_fhw: tuple, grid_conf: dict, outC: int, sensor_type: str, camC: int, radarC: int,
-                 net_name='convnext'):
+                 net_name='convnext',simple_bev=True):
         super(LiftSplatShoot, self).__init__()
         self.org_fhw = org_fhw
         self.grid_conf = grid_conf
@@ -63,13 +64,14 @@ class LiftSplatShoot(nn.Module):
         self.radarC = radarC
         self.sensor_type = sensor_type
         self.D, _, _, _ = self.frustum.shape
+        self.simple_bev = simple_bev
 
         self.camencode = getCamEncoder(self.D, self.camC, net_name=net_name)
         self.bevencode = BevEncode(inC=self.camC + self.radarC, outC=outC)
 
-        self.nx = torch.LongTensor([(row[1] - row[0]) / row[2] for row in [self.grid_conf['xbound'],
-                                                                           self.grid_conf['ybound'],
-                                                                           self.grid_conf['zbound']]])
+        self.nx = torch.Tensor([(row[1] - row[0]) / row[2] for row in [self.grid_conf['xbound'],
+                                                                       self.grid_conf['ybound'],
+                                                                       self.grid_conf['zbound']]])
         self.dx = torch.Tensor([row[2] for row in [self.grid_conf['xbound'],
                                                    self.grid_conf['ybound'],
                                                    self.grid_conf['zbound']]])
@@ -92,6 +94,37 @@ class LiftSplatShoot(nn.Module):
         ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
         frustum = torch.stack((xs, ys, ds), -1)
         return nn.Parameter(frustum, requires_grad=False)
+
+    def create_sampling_grid(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor, H: int,
+                             W: int, image_features: torch.Tensor) -> torch.Tensor:
+        z_range = torch.arange(0, self.grid_conf['zbound'][1] - self.grid_conf['zbound'][0],
+                               self.grid_conf['zbound'][2])
+        x_range = torch.arange(0, self.grid_conf['xbound'][1] - self.grid_conf['xbound'][0],
+                               self.grid_conf['xbound'][2])
+        y_range = torch.arange(0, self.grid_conf['ybound'][1] - self.grid_conf['ybound'][0],
+                               self.grid_conf['ybound'][2])
+
+        z, x, y = torch.meshgrid(z_range, x_range, y_range)  # camera coordinate
+        grid_3d = torch.stack([x, y, z], dim=-1).view(-1, 3).T
+
+        grid_2d = torch.matmul(intrins, grid_3d).T  # camera pixel
+        grid_2d_list = []
+        for batch in range(post_rots.shape[0]):
+            grid_2d_list.append(grid_2d.unsqueeze(0))
+        grid_2d = torch.stack(grid_2d_list, dim=0).view(-1, 3)
+
+        grid_2d = grid_2d - post_trans
+        grid_2d = torch.matmul(torch.inverse(post_rots), grid_2d.T).T
+        grid_2d = grid_2d[:, :2] / grid_2d[:, 2:]  # (batch*row, 2)
+
+        grid_2d[:, 0] /= W
+        grid_2d[:, 1] /= H
+
+        grid_2d = 2.0 * grid_2d - 1
+        grid_2d.view(post_rots.shape[0], len(z_range), len(x_range), 2)
+        bev_features = F.grid_sample(image_features, grid_2d, mode='bilinear')
+
+        return bev_features
 
     def get_geometry(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor) -> torch.Tensor:
         B = intrins.shape[0]
@@ -147,16 +180,28 @@ class LiftSplatShoot(nn.Module):
         x = self.voxel_splat(geom, x)
         return x
 
+    def get_voxels_3d(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor,
+                      post_trans: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x = self.get_cam_feats(x)
+        self.create_sampling_grid(intrins, post_rots, post_trans, H, W, x)
+
     def forward(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
                 radar_bev: torch.Tensor) -> torch.Tensor:
         if self.sensor_type == "fusion":
-            x = self.get_voxels(x, intrins, post_rots, post_trans)
+            if self.simple_bev:
+                x = self.get_voxels_3d(x, intrins, post_rots, post_trans)
+            else:
+                x = self.get_voxels(x, intrins, post_rots, post_trans)
             radar_bev = radar_bev.permute(0, 3, 1, 2)
             x = torch.cat((x, radar_bev), 1)
         elif self.sensor_type == "radar":
             x = radar_bev.permute(0, 3, 1, 2)
         elif self.sensor_type == "camera":
-            x = self.get_voxels(x, intrins, post_rots, post_trans)
+            if self.simple_bev:
+                x = self.get_voxels_3d(x, intrins, post_rots, post_trans)
+            else:
+                x = self.get_voxels(x, intrins, post_rots, post_trans)
         else:
             raise ValueError(f"Unsupported sensor type: {self.sensor_type}")
 
@@ -206,3 +251,16 @@ def ddp_setup(rank: int, world_size: int):
 
 if __name__ == "__main__":
     world_size = torch.cuda.device_count()
+
+    xbound = [-20.0, 20.0, 0.1]
+    ybound = [-10.0, 10.0, 20.0]
+    zbound = [0, 40.0, 0.1]
+    dbound = [3.0, 43.0, 1.0]
+
+    grid = {
+        'xbound': xbound,
+        'ybound': ybound,
+        'zbound': zbound,
+        'dbound': dbound,
+    }
+    lss = LiftSplatShoot((256, 512), grid, 1, 'fusion', 64, 3)
