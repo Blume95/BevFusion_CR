@@ -4,13 +4,17 @@ from model.simple_fusion import LiftSplatShoot
 import numpy as np
 import cv2
 from tools.tool import ddp_setup
+
+
 def parameters():
     final_hw = (256, 512)
     org_hw = (1216, 1936)
 
-    xbound = [-20.0, 20.0, 0.1]
+    simple_bev = True
+
+    xbound = [-10.0, 10.0, 0.1]
     ybound = [-10.0, 10.0, 20.0]
-    zbound = [0, 40.0, 0.1]
+    zbound = [3, 43.0, 0.1]
     dbound = [3.0, 43.0, 1.0]
     grid = {
         'xbound': xbound,
@@ -59,6 +63,7 @@ def parameters():
         "radar_channel": radar_channel,
         'net_name': "convnext",
         "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        "simple_bev": simple_bev
 
     }
     return training_parameters
@@ -82,26 +87,28 @@ def vis(parameters):
     val_step = parameters['val_step']
     net_name = parameters['net_name']
     device = parameters['device']
+    simple_bev = parameters['simple_bev']
 
     ddp_setup(0, 1)
 
     train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=workers,
                                            batch_size=1, data_aug_conf=data_aug_conf)
 
-    model = LiftSplatShoot(org_fhw=final_hw, grid_conf=grid, outC=out_channel, sensor_type=sensor_type,
-                           camC=cam_channel, radarC=radar_channel, net_name=net_name)
+    model = LiftSplatShoot(org_fhw=final_hw, org_fh=org_hw, grid_conf=grid, outC=out_channel, sensor_type=sensor_type,
+                           camC=cam_channel, radarC=radar_channel, net_name=net_name, simple_bev=simple_bev)
 
     model.load_state_dict(
-        torch.load("/home/jing/Downloads/bev_result/weights/model_2400.pt", map_location=device))
+        torch.load("/home/jing/Downloads/bev_result/weights/model_600.pt", map_location=device))
     model.to(device)
     model.eval()
     total_intersect = 0
     total_union = 0
     with torch.no_grad():
-        for index_batch, (img_, extrinsic_, intrinsic_, post_rot_, post_tran_, gt_binimg_, radar_bev, image_name) in enumerate(
+        for index_batch, (
+        img_, extrinsic_, intrinsic_, post_rot_, post_tran_, gt_binimg_, radar_bev, image_name) in enumerate(
                 val_loader):
             preds = model(img_.to(device), intrinsic_.to(device), post_rot_.to(device), post_tran_.to(device),
-                          radar_bev.to(device),image_name)
+                          radar_bev.to(device), image_name)
 
             preds_np = preds[0, 0, :, :].cpu()
             preds_np_mask = (preds_np > 0)

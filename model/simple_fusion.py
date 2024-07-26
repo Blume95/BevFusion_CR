@@ -1,10 +1,15 @@
 import torch
 from torch import nn
 from torchvision.models.resnet import resnet18
-from torch.distributed import init_process_group
+from torch.distributed import init_process_group, destroy_process_group
 import os
+from tqdm import tqdm
+
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from model.up_conv import Up
 from model.camera_encoder import getCamEncoder
+import torch.nn.functional as F
 import cv2
 
 
@@ -49,10 +54,12 @@ class QuickCumsum(torch.autograd.Function):
 
 
 class LiftSplatShoot(nn.Module):
-    def __init__(self, org_fhw: tuple, grid_conf: dict, outC: int, sensor_type: str, camC: int, radarC: int,
-                 net_name='convnext'):
+    def __init__(self, org_fhw: tuple, org_fh: tuple, grid_conf: dict, outC: int, sensor_type: str, camC: int,
+                 radarC: int,
+                 net_name='convnext', simple_bev=True):
         super(LiftSplatShoot, self).__init__()
         self.org_fhw = org_fhw
+        self.org_hw = org_fh
         self.grid_conf = grid_conf
         self.downsample = 16
         self.frustum = self.create_frustum_1camera()
@@ -60,9 +67,13 @@ class LiftSplatShoot(nn.Module):
         self.radarC = radarC
         self.sensor_type = sensor_type
         self.D, _, _, _ = self.frustum.shape
+        self.simple_bev = simple_bev
 
         self.camencode = getCamEncoder(self.D, self.camC, net_name=net_name)
-        self.bevencode = BevEncode(inC=self.camC + self.radarC, outC=outC)
+        if simple_bev:
+            self.bevencode = BevEncode(inC=self.camC + self.D + self.radarC, outC=outC)
+        else:
+            self.bevencode = BevEncode(inC=self.camC + self.radarC, outC=outC)
 
         self.nx = torch.LongTensor([(row[1] - row[0]) / row[2] for row in [self.grid_conf['xbound'],
                                                                            self.grid_conf['ybound'],
@@ -80,10 +91,83 @@ class LiftSplatShoot(nn.Module):
 
         self.use_quickcumsum = True
 
+    def create_frustum_1camera(self) -> nn.Parameter:
+        ogfH, ogfW = self.org_fhw
+        fH, fW = ogfH // self.downsample, ogfW // self.downsample
+        ds = torch.arange(*self.grid_conf['dbound'], dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
+        D, _, _ = ds.shape
+        xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(D, fH, fW)
+        ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
+        frustum = torch.stack((xs, ys, ds), -1)
+        return nn.Parameter(frustum, requires_grad=False)
+
+    def create_sampling_grid(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
+                             image_features: torch.Tensor) -> torch.Tensor:
+        z_range = torch.arange(3, 43, 0.1, device=image_features.device)  # Adjusted range step for memory
+        x_range = torch.arange(-10, 10, 0.1, device=image_features.device)  # Adjusted range step for memory
+        y_range = torch.arange(-2, 20, 1.0, device=image_features.device)
+
+        x, y, z = torch.meshgrid(x_range, y_range, z_range)  # camera coordinate
+        grid_3d = torch.stack([x, y, z], dim=-1).view(-1, 3).unsqueeze(0).repeat(image_features.shape[0], 1,
+                                                                                 1).permute(0, 2,
+                                                                                            1)  # (batch 3, points_number)
+        # print(grid_3d[0,:,0])
+        # print(intrins.shape)
+
+        grid_2d = torch.bmm(intrins, grid_3d)
+        # grid_3d = grid_3d.view(post_rots.shape[0], 3, len(x_range), len(y_range), len(z_range))  # (batch, 3, x,y,z)
+        # print(grid_3d[0, :, 200, 5, 300])
+        grid_2d = grid_2d[:, :2, :] / grid_2d[:, 2:, :]
+        # grid_2d_tem = grid_2d.view(post_rots.shape[0], 2, len(x_range), len(y_range), len(z_range))
+        # print(grid_2d_tem[0, :, 200, 5, 300]/torch.tensor([self.org_hw[1], self.org_hw[0]],device=image_features.device))
+
+        grid_2d = grid_2d / torch.tensor([self.org_hw[1], self.org_hw[0]], device=image_features.device).view(1, 2, 1)
+        grid_2d = 2.0 * grid_2d - 1  # normalize to [-1, 1]
+        grid_2d = grid_2d.view(post_rots.shape[0], 2, len(x_range), len(y_range), len(z_range))  # (batch, 2, x,y,z)
+        grid_2d = grid_2d.permute(0, 2, 3, 4, 1)  # (batch, x,y,z,2)
+        # grid_2d[:, :, :, :, 0], grid_2d[:, :, :, :, 1] = grid_2d[:, :, :, :, 1], grid_2d[:, :, :, :, 0]
+        # print(grid_2d[0, 200, 5, 300, :])
+        #
+        # print(image_features.shape)
+        # print(grid_2d.shape)
+        # image_features = image_features.permute(0, 1, 3, 2)
+
+        bev_features = torch.zeros(grid_2d.shape[0], image_features.shape[1], grid_2d.shape[1], grid_2d.shape[3]).to(
+            image_features.device)
+        # print(bev_features.shape)
+        for y_index in range(len(y_range)):
+            bev_features += F.grid_sample(image_features, grid_2d[:, :, y_index, :, :], mode='bilinear',
+                                          align_corners=False)
+
+        bev_features = bev_features / len(y_range)
+        # print(bev_features.shape)
+        bev_features = bev_features.permute(0, 1, 3, 2)
+
+        return bev_features
+
+    def get_geometry(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor) -> torch.Tensor:
+        B = intrins.shape[0]
+        points = self.frustum - post_trans.view(B, 1, 1, 1, 3)
+        points = torch.inverse(post_rots).view(B, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+        points = torch.cat((points[:, :, :, :, :2] * points[:, :, :, :, 2:3],
+                            points[:, :, :, :, 2:3]), 4)
+        points = torch.inverse(intrins).view(B, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        return points
+
+    def get_cam_feats(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, imH, imW = x.shape
+        x = self.camencode(x, self.simple_bev)
+
+        if not self.simple_bev:
+            x = x.view(B, self.camC, self.D, imH // self.downsample, imW // self.downsample)
+            x = x.permute(0, 2, 3, 4, 1)
+        return x
+
     def normalazation(self, x):
         C, H, W = x.shape
-        x = x.view(C, -1)
-        return ((x - torch.min(x, dim=1).values.view(-1,1)) / (torch.max(x, dim=1).values - torch.min(x, dim=1).values).view(-1,1)).view(C,H,W)
+        x = x.reshape(C, -1)
+        return ((x - torch.min(x, dim=1).values.view(-1, 1)) / (
+                torch.max(x, dim=1).values - torch.min(x, dim=1).values).view(-1, 1)).view(C, H, W)
 
     def get_vis_feats(self, x, radar, fusion, img_names):
         B, C, H, W = x.shape
@@ -104,32 +188,6 @@ class LiftSplatShoot(nn.Module):
             out = out * 255
             out = out.cpu().numpy()
             cv2.imwrite(f"/home/jing/Downloads/bev_result/feat_vis/{img_name.split('/')[-1]}", out)
-
-    def create_frustum_1camera(self) -> nn.Parameter:
-        ogfH, ogfW = self.org_fhw
-        fH, fW = ogfH // self.downsample, ogfW // self.downsample
-        ds = torch.arange(*self.grid_conf['dbound'], dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
-        D, _, _ = ds.shape
-        xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(D, fH, fW)
-        ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
-        frustum = torch.stack((xs, ys, ds), -1)
-        return nn.Parameter(frustum, requires_grad=False)
-
-    def get_geometry(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor) -> torch.Tensor:
-        B = intrins.shape[0]
-        points = self.frustum - post_trans.view(B, 1, 1, 1, 3)
-        points = torch.inverse(post_rots).view(B, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
-        points = torch.cat((points[:, :, :, :, :2] * points[:, :, :, :, 2:3],
-                            points[:, :, :, :, 2:3]), 4)
-        points = torch.inverse(intrins).view(B, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
-        return points
-
-    def get_cam_feats(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, imH, imW = x.shape
-        x = self.camencode(x)
-        x = x.view(B, self.camC, self.D, imH // self.downsample, imW // self.downsample)
-        x = x.permute(0, 2, 3, 4, 1)
-        return x
 
     def voxel_splat(self, look_up_table: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         B, D, H, W, C = x.shape
@@ -169,19 +227,39 @@ class LiftSplatShoot(nn.Module):
         x = self.voxel_splat(geom, x)
         return x
 
+    def get_voxels_3d(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor,
+                      post_trans: torch.Tensor, image_names: str) -> torch.Tensor:
+        x = self.get_cam_feats(x)
+        x_feat = self.normalazation(torch.abs(x[0]))
+        x_i_feat = torch.mean(x_feat, dim=0)
+        x_i_feat = x_i_feat * 255
+        x_i_feat = x_i_feat.cpu().numpy()
+        x_i_feat = cv2.resize(x_i_feat, fx=8, fy=8, interpolation=cv2.INTER_CUBIC,
+                              dsize=(x_i_feat.shape[1] * 8, x_i_feat.shape[0] * 8))
+        cv2.imwrite(f"/home/jing/Downloads/bev_result/x_feat/{image_names[0].split('/')[-1]}", x_i_feat)
+        return self.create_sampling_grid(intrins, post_rots, post_trans, x)
+
     def forward(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
-                radar_bev: torch.Tensor, image_name: str) -> torch.Tensor:
+                radar_bev: torch.Tensor, image_names: str) -> torch.Tensor:
         if self.sensor_type == "fusion":
-            x = self.get_voxels(x, intrins, post_rots, post_trans)
-            tem = {"tem": x}
+            if self.simple_bev:
+                x = self.get_voxels_3d(x, intrins, post_rots, post_trans, image_names)
+            else:
+                x = self.get_voxels(x, intrins, post_rots, post_trans)
             radar_bev = radar_bev.permute(0, 3, 1, 2)
+            tem = x
+            # print(x.shape)
+            # print(radar_bev.shape)
             x = torch.cat((x, radar_bev), 1)
 
-            self.get_vis_feats(tem['tem'], radar_bev, x, image_name)
+            self.get_vis_feats(tem, radar_bev, x, image_names)
         elif self.sensor_type == "radar":
             x = radar_bev.permute(0, 3, 1, 2)
         elif self.sensor_type == "camera":
-            x = self.get_voxels(x, intrins, post_rots, post_trans)
+            if self.simple_bev:
+                x = self.get_voxels_3d(x, intrins, post_rots, post_trans)
+            else:
+                x = self.get_voxels(x, intrins, post_rots, post_trans)
         else:
             raise ValueError(f"Unsupported sensor type: {self.sensor_type}")
 
@@ -231,3 +309,16 @@ def ddp_setup(rank: int, world_size: int):
 
 if __name__ == "__main__":
     world_size = torch.cuda.device_count()
+
+    xbound = [-20.0, 20.0, 0.1]
+    ybound = [-10.0, 10.0, 20.0]
+    zbound = [0, 40.0, 0.1]
+    dbound = [3.0, 43.0, 1.0]
+
+    grid = {
+        'xbound': xbound,
+        'ybound': ybound,
+        'zbound': zbound,
+        'dbound': dbound,
+    }
+    lss = LiftSplatShoot((256, 512), grid, 1, 'fusion', 64, 3)

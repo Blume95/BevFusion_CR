@@ -42,9 +42,13 @@ class CamEncodeEffB0(nn.Module):
         x = self.up1(endpoints['reduction_5'], endpoints['reduction_4'])
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, simple_bev: bool) -> torch.Tensor:
         # x batch , 3 , h, w
-        x = self.get_depth_feat(x)
+        if simple_bev:
+            x = self.get_eff_depth(x)
+            x = self.depthnet(x)
+        else:
+            x = self.get_depth_feat(x)
         return x
 
 
@@ -96,9 +100,13 @@ class CamEncoderConvNextTiny(nn.Module):
         x = self.up1(endpoints["last_layer"], endpoints["pre_layer"])
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, simple_bev: bool) -> torch.Tensor:
         # x batch , 3 , h, w
-        x = self.get_depth_feat(x)
+        if simple_bev:
+            x = self.get_eff_depth(x)
+            x = self.depthnet(x)
+        else:
+            x = self.get_depth_feat(x)
         return x
 
 
