@@ -12,9 +12,9 @@ def parameters():
 
     simple_bev = True
 
-    xbound = [-10.0, 10.0, 0.1]
+    xbound = [-20.0, 20.0, 0.1]
     ybound = [-10.0, 10.0, 20.0]
-    zbound = [3, 43.0, 0.1]
+    zbound = [1, 41.0, 0.1]
     dbound = [3.0, 43.0, 1.0]
     grid = {
         'xbound': xbound,
@@ -61,7 +61,7 @@ def parameters():
         "org_hw": org_hw,
         "cam_channel": cam_channel,
         "radar_channel": radar_channel,
-        'net_name': "convnext",
+        'net_name': "eff_b0",
         "device": torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
         "simple_bev": simple_bev
 
@@ -98,7 +98,7 @@ def vis(parameters):
                            camC=cam_channel, radarC=radar_channel, net_name=net_name, simple_bev=simple_bev)
 
     model.load_state_dict(
-        torch.load("/home/jing/Downloads/bev_result/weights/model_600.pt", map_location=device))
+        torch.load("/home/jing/Downloads/bev_result/weights/model_16200.pt", map_location=device))
     model.to(device)
     model.eval()
     total_intersect = 0
@@ -127,7 +127,7 @@ def vis(parameters):
 
             for i in range(preds.shape[0]):
                 show_img = cv2.imread(image_name[i], -1)
-                pred_np = preds[i].sigmoid().cpu() > 0.01
+                pred_np = preds[i].sigmoid().cpu() > 0.5
                 pred_np = (pred_np.numpy() * 255).astype(np.uint8)
                 gt_np = gt_binimg_[i].cpu().numpy()
                 gt_np = (gt_np * 255).astype(np.uint8)

@@ -104,8 +104,8 @@ class LiftSplatShoot(nn.Module):
     def create_sampling_grid(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
                              image_features: torch.Tensor) -> torch.Tensor:
         z_range = torch.arange(3, 43, 0.1, device=image_features.device)  # Adjusted range step for memory
-        x_range = torch.arange(-10, 10, 0.1, device=image_features.device)  # Adjusted range step for memory
-        y_range = torch.arange(-2, 20, 1.0, device=image_features.device)
+        x_range = torch.arange(-20, 20, 0.1, device=image_features.device)  # Adjusted range step for memory
+        y_range = -torch.arange(-4, 8, 0.5, device=image_features.device)
 
         x, y, z = torch.meshgrid(x_range, y_range, z_range)  # camera coordinate
         grid_3d = torch.stack([x, y, z], dim=-1).view(-1, 3).unsqueeze(0).repeat(image_features.shape[0], 1,
