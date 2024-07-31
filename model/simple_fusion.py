@@ -54,26 +54,21 @@ class QuickCumsum(torch.autograd.Function):
 
 
 class LiftSplatShoot(nn.Module):
-    def __init__(self, org_fhw: tuple, org_fh: tuple, grid_conf: dict, outC: int, sensor_type: str, camC: int,
+    def __init__(self, org_fhw: tuple, org_hw: tuple, grid_conf: dict, outC: int, camC: int,
                  radarC: int,
-                 net_name='convnext', simple_bev=True):
+                 method: str):
         super(LiftSplatShoot, self).__init__()
         self.org_fhw = org_fhw
-        self.org_hw = org_fh
+        self.org_hw = org_hw
         self.grid_conf = grid_conf
         self.downsample = 16
         self.frustum = self.create_frustum_1camera()
         self.camC = camC
         self.radarC = radarC
-        self.sensor_type = sensor_type
         self.D, _, _, _ = self.frustum.shape
-        self.simple_bev = simple_bev
 
-        self.camencode = getCamEncoder(self.D, self.camC, net_name=net_name)
-        if simple_bev:
-            self.bevencode = BevEncode(inC=self.camC + self.D + self.radarC, outC=outC)
-        else:
-            self.bevencode = BevEncode(inC=self.camC + self.radarC, outC=outC)
+        self.camencode = getCamEncoder(self.D, self.camC, method=method)
+        self.bevencode = BevEncode(inC=self.camC + self.radarC, outC=outC)
 
         self.nx = torch.LongTensor([(row[1] - row[0]) / row[2] for row in [self.grid_conf['xbound'],
                                                                            self.grid_conf['ybound'],
@@ -101,47 +96,44 @@ class LiftSplatShoot(nn.Module):
         frustum = torch.stack((xs, ys, ds), -1)
         return nn.Parameter(frustum, requires_grad=False)
 
+    def create_3d_voxels(self):
+        z_range = torch.arange(self.grid_conf['zbound'][0], self.grid_conf['zbound'][1],
+                               self.grid_conf['zbound'][2])  # Adjusted range step for memory
+        x_range = torch.arange(self.grid_conf['xbound'][0], self.grid_conf['xbound'][1],
+                               self.grid_conf['xbound'][2])  # Adjusted range step for memory
+        y_range = -torch.arange(self.grid_conf['ybound'][0], self.grid_conf['ybound'][1],
+                                self.grid_conf['ybound'][2])
+        x, y, z = torch.meshgrid(x_range, y_range, z_range)  # camera coordinate
+
+        return x, y, z
+
     def create_sampling_grid(self, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
                              image_features: torch.Tensor) -> torch.Tensor:
-        z_range = torch.arange(3, 43, 0.1, device=image_features.device)  # Adjusted range step for memory
-        x_range = torch.arange(-20, 20, 0.1, device=image_features.device)  # Adjusted range step for memory
-        y_range = -torch.arange(-4, 8, 0.5, device=image_features.device)
 
-        x, y, z = torch.meshgrid(x_range, y_range, z_range)  # camera coordinate
-        grid_3d = torch.stack([x, y, z], dim=-1).view(-1, 3).unsqueeze(0).repeat(image_features.shape[0], 1,
-                                                                                 1).permute(0, 2,
-                                                                                            1)  # (batch 3, points_number)
-        # print(grid_3d[0,:,0])
-        # print(intrins.shape)
+        x, y, z = self.create_3d_voxels()  # camera coordinate
+        grid_3d = torch.stack([x.to(image_features.device), y.to(image_features.device), z.to(image_features.device)],
+                              dim=-1).view(-1, 3).unsqueeze(0).repeat(image_features.shape[0], 1,
+                                                                      1).permute(0, 2,
+                                                                                 1)  # (batch 3, points_number)
 
         grid_2d = torch.bmm(intrins, grid_3d)
-        # grid_3d = grid_3d.view(post_rots.shape[0], 3, len(x_range), len(y_range), len(z_range))  # (batch, 3, x,y,z)
-        # print(grid_3d[0, :, 200, 5, 300])
+        grid_2d -= post_trans.view(grid_2d.shape[0], 3, 1, 1, 1)
+        grid_2d = torch.inverse(post_rots).view(grid_2d.shape[0], 3, 3, 1, 1, 1).matmul(grid_2d.unsqueeze(2)).squeeze(2)
         grid_2d = grid_2d[:, :2, :] / grid_2d[:, 2:, :]
-        # grid_2d_tem = grid_2d.view(post_rots.shape[0], 2, len(x_range), len(y_range), len(z_range))
-        # print(grid_2d_tem[0, :, 200, 5, 300]/torch.tensor([self.org_hw[1], self.org_hw[0]],device=image_features.device))
 
         grid_2d = grid_2d / torch.tensor([self.org_hw[1], self.org_hw[0]], device=image_features.device).view(1, 2, 1)
         grid_2d = 2.0 * grid_2d - 1  # normalize to [-1, 1]
-        grid_2d = grid_2d.view(post_rots.shape[0], 2, len(x_range), len(y_range), len(z_range))  # (batch, 2, x,y,z)
-        grid_2d = grid_2d.permute(0, 2, 3, 4, 1)  # (batch, x,y,z,2)
-        # grid_2d[:, :, :, :, 0], grid_2d[:, :, :, :, 1] = grid_2d[:, :, :, :, 1], grid_2d[:, :, :, :, 0]
-        # print(grid_2d[0, 200, 5, 300, :])
-        #
-        # print(image_features.shape)
-        # print(grid_2d.shape)
-        # image_features = image_features.permute(0, 1, 3, 2)
+        grid_2d = grid_2d.view(image_features.shape[0], 2, x.shape[0], x.shape[1], x.shape[2])  # (batch, 2, x,y,z)
+        grid_2d = grid_2d.permute(0, 4, 3, 2, 1)  # (batch, z,y,x,2)
 
-        bev_features = torch.zeros(grid_2d.shape[0], image_features.shape[1], grid_2d.shape[1], grid_2d.shape[3]).to(
-            image_features.device)
+        bev_features = []
         # print(bev_features.shape)
-        for y_index in range(len(y_range)):
-            bev_features += F.grid_sample(image_features, grid_2d[:, :, y_index, :, :], mode='bilinear',
-                                          align_corners=False)
+        for y_index in range(x.shape[1]):
+            # batch size, 64, H, W
+            bev_features.append(F.grid_sample(image_features, grid_2d[:, :, y_index, :, :], mode='bilinear',
+                                          align_corners=False))
 
-        bev_features = bev_features / len(y_range)
-        # print(bev_features.shape)
-        bev_features = bev_features.permute(0, 1, 3, 2)
+        bev_features = torch.cat(bev_features, dim=1).reshape(grid_2d.shape[0], grid_2d.shape[2]*image_features.shape[1], grid_2d.shape[1], grid_2d.shape[3])
 
         return bev_features
 
@@ -168,26 +160,6 @@ class LiftSplatShoot(nn.Module):
         x = x.reshape(C, -1)
         return ((x - torch.min(x, dim=1).values.view(-1, 1)) / (
                 torch.max(x, dim=1).values - torch.min(x, dim=1).values).view(-1, 1)).view(C, H, W)
-
-    def get_vis_feats(self, x, radar, fusion, img_names):
-        B, C, H, W = x.shape
-        for b in range(B):
-            img_name = img_names[b]
-
-            x_i = self.normalazation(torch.abs(x[b]))
-            radar_i = self.normalazation(torch.abs(radar[b]))
-            fusion_i = self.normalazation(torch.abs(fusion[b]))
-            # print(x_i.shape, radar_i.shape, fusion_i.shape)
-
-            x_i_feat = torch.mean(x_i, dim=0)
-            radar_i_feat = torch.mean(radar_i, dim=0)
-            fusion_i_feat = torch.mean(fusion_i, dim=0)
-
-            # print(x_i_feat.shape, radar_i_feat.shape, fusion_i_feat.shape)
-            out = torch.cat((x_i_feat, radar_i_feat, fusion_i_feat), dim=1)
-            out = out * 255
-            out = out.cpu().numpy()
-            cv2.imwrite(f"/home/jing/Downloads/bev_result/feat_vis/{img_name.split('/')[-1]}", out)
 
     def voxel_splat(self, look_up_table: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         B, D, H, W, C = x.shape
@@ -228,40 +200,30 @@ class LiftSplatShoot(nn.Module):
         return x
 
     def get_voxels_3d(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor,
-                      post_trans: torch.Tensor, image_names: str) -> torch.Tensor:
+                      post_trans: torch.Tensor) -> torch.Tensor:
         x = self.get_cam_feats(x)
-        x_feat = self.normalazation(torch.abs(x[0]))
-        x_i_feat = torch.mean(x_feat, dim=0)
-        x_i_feat = x_i_feat * 255
-        x_i_feat = x_i_feat.cpu().numpy()
-        x_i_feat = cv2.resize(x_i_feat, fx=8, fy=8, interpolation=cv2.INTER_CUBIC,
-                              dsize=(x_i_feat.shape[1] * 8, x_i_feat.shape[0] * 8))
-        cv2.imwrite(f"/home/jing/Downloads/bev_result/x_feat/{image_names[0].split('/')[-1]}", x_i_feat)
         return self.create_sampling_grid(intrins, post_rots, post_trans, x)
 
     def forward(self, x: torch.Tensor, intrins: torch.Tensor, post_rots: torch.Tensor, post_trans: torch.Tensor,
-                radar_bev: torch.Tensor, image_names: str) -> torch.Tensor:
-        if self.sensor_type == "fusion":
-            if self.simple_bev:
-                x = self.get_voxels_3d(x, intrins, post_rots, post_trans, image_names)
-            else:
-                x = self.get_voxels(x, intrins, post_rots, post_trans)
-            radar_bev = radar_bev.permute(0, 3, 1, 2)
-            tem = x
-            # print(x.shape)
-            # print(radar_bev.shape)
-            x = torch.cat((x, radar_bev), 1)
+                radar_bev: torch.Tensor) -> torch.Tensor:
 
-            self.get_vis_feats(tem, radar_bev, x, image_names)
-        elif self.sensor_type == "radar":
-            x = radar_bev.permute(0, 3, 1, 2)
-        elif self.sensor_type == "camera":
-            if self.simple_bev:
-                x = self.get_voxels_3d(x, intrins, post_rots, post_trans)
+        if self.useRadar:
+            radar_bev = radar_bev.permute(0, 3, 1, 2)
+
+        if self.useCamera:
+            if self.method == 'lss':
+                camera_bev = self.get_voxels(x, intrins, post_rots, post_trans)
+            elif self.method == 'bilinear':
+                camera_bev = self.get_voxels_3d(x, intrins, post_rots, post_trans)
             else:
-                x = self.get_voxels(x, intrins, post_rots, post_trans)
-        else:
-            raise ValueError(f"Unsupported sensor type: {self.sensor_type}")
+                raise ValueError('method must be either \'lss\' or \'bilinear\'')
+
+        if self.useRadar and self.useCamera:
+            x = torch.cat((camera_bev, radar_bev), 1)
+        elif self.useRadar and not self.useCamera:
+            x = radar_bev
+        elif self.useCamera and not self.useRadar:
+            x = camera_bev
 
         x = self.bevencode(x)
         return x

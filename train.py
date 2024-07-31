@@ -5,7 +5,7 @@ from torch.distributed import destroy_process_group
 import os
 from datetime import datetime
 from tools.tool import ddp_setup, SimpleLoss, get_val_info
-from data.vod_dataset import dataloaders
+from data.vod import dataloaders
 from model.simple_fusion import LiftSplatShoot
 from torch.utils.tensorboard import SummaryWriter
 import pickle
@@ -25,21 +25,20 @@ def train(rank: int,
     batch_size = parameters['batch_size']
     data_aug_conf = parameters['data_aug_conf']
     out_channel = parameters['out_channel']
-    sensor_type = parameters['fusion_type']
+    method = parameters['method']
     cam_channel = parameters['cam_channel']
     radar_channel = parameters['radar_channel']
     lr = parameters['lr']
     weight_decay = parameters['weight_decay']
     nepochs = parameters['nepochs']
     val_step = parameters['val_step']
-    net_name = parameters['net_name']
 
     ddp_setup(rank, world_size)
     train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=workers,
                                            batch_size=batch_size, data_aug_conf=data_aug_conf)
 
-    model = LiftSplatShoot(org_fhw=final_hw, grid_conf=grid, outC=out_channel, sensor_type=sensor_type,
-                           camC=cam_channel, radarC=radar_channel, net_name=net_name)
+    model = LiftSplatShoot(org_fhw=final_hw, org_hw=org_hw, grid_conf=grid, outC=out_channel, camC=cam_channel, radarC=radar_channel,
+                           method=method)
     model.to(rank)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank], find_unused_parameters=True)
@@ -67,9 +66,17 @@ def train(rank: int,
         # print(epoch)
         total_intersect = 0.0
         total_union = 0.0
-        for index_batch, (img_, extrinsic_, intrinsic_, post_rot_, post_tran_, gt_binimg_, radar_bev) in enumerate(
+        for index_batch, out_dict in enumerate(
                 train_loader):
             opt.zero_grad()
+
+            img_ = out_dict['image']
+            intrinsic_ = out_dict['intrinsic']
+            post_tran_ = out_dict['post_trans']
+            post_rot_ = out_dict['post_rot']
+            radar_bev = out_dict['radar_features']
+            gt_binimg_ = out_dict['ground_truth']
+
             # print(img_.shape)
             preds = model(img_.to(device), intrinsic_.to(device), post_rot_.to(device), post_tran_.to(device),
                           radar_bev.to(device))
@@ -107,13 +114,19 @@ def train(rank: int,
 
 
 def main():
-    final_hw = (256, 512)
+    final_hw = (128, 256)
     org_hw = (1216, 1936)
-
-    xbound = [-20.0, 20.0, 0.1]
-    ybound = [-10.0, 10.0, 20.0]
-    zbound = [0, 40.0, 0.1]
-    dbound = [3.0, 43.0, 1.0]
+    method = 'lss'
+    if method == "lss":
+        xbound = [-20.0, 20.0, 0.1]
+        ybound = [-10.0, 10.0, 20.0]
+        zbound = [0, 40.0, 0.1]
+        dbound = [3.0, 43.0, 1.0]
+    elif method == "bilinear":
+        xbound = [-20.0, 20.0, 0.5]
+        ybound = [-10.0, 10.0, 0.5]
+        zbound = [0.1, 40.1, 0.1]
+        dbound = [3.0, 43.0, 1.0]
     grid = {
         'xbound': xbound,
         'ybound': ybound,
@@ -133,22 +146,18 @@ def main():
     world_size = torch.cuda.device_count()
 
     out_channel = 1
-    fusion_type = "fusion"
-    if fusion_type == "fusion":
-        cam_channel = 64
+    use_Radar = False
+    use_Cam = True
+    radar_channel = 0
+    cam_channel = 0
+
+    if use_Radar:
         radar_channel = 3
-    elif fusion_type == 'radar':
-        cam_channel = 0
-        radar_channel = 3
-    elif fusion_type == 'camera':
+    if use_Cam:
         cam_channel = 64
-        radar_channel = 0
-    else:
-        raise ValueError(f"Unsupported sensor type: {fusion_type}")
 
     training_parameters = {
         "out_channel": out_channel,
-        "fusion_type": fusion_type,
         "batch_size": 12,
         "workers": 4,
         "lr": 1e-4,
@@ -161,7 +170,7 @@ def main():
         "org_hw": org_hw,
         "cam_channel": cam_channel,
         "radar_channel": radar_channel,
-        'net_name': "convnext"
+        "method":method
 
     }
 

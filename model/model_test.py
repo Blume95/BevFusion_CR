@@ -39,11 +39,15 @@ class CustomConvNeXt(nn.Module):
         return x
 
 
-# Instantiate the custom model
-custom_model = CustomConvNeXt(convnext_tiny)
-
-# Test the custom model with dummy input
-dummy_input = torch.randn(1, 3, 224, 224)  # Batch size of 1, 3 color channels, 224x224 image
-output = custom_model(dummy_input)
-
-print(output.shape)  # Output shape will depend on the layers used
+# # Instantiate the custom model
+# custom_model = CustomConvNeXt(convnext_tiny)
+#
+# # Test the custom model with dummy input
+# dummy_input = torch.randn(1, 3, 224, 224)  # Batch size of 1, 3 color channels, 224x224 image
+# output = custom_model(dummy_input)
+#
+# print(output.shape)  # Output shape will depend on the layers used
+# a = torch.Tensor([[[1, 2, 3], [4, 5, 6], [7, 8, 9]]])
+# b = None
+# print(torch.cat([a, b]))
+print(torch.arange(1, 41, 0.1))
