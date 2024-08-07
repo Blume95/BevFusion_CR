@@ -226,16 +226,15 @@ class VodData(Dataset):
         post_rot = torch.eye(2)
         post_tran = torch.zeros(2)
 
-        resize, resize_dims, crop, flip, rotate = self.sample_augmentation()
-
         if self.data_aug_conf is not None:
+            resize, resize_dims, crop, flip, rotate = self.sample_augmentation()
             img, post_rot2, post_tran2 = VodData.img_transform(img, post_rot, post_tran, resize=resize,
                                                                resize_dims=resize_dims,
                                                                crop=crop, flip=flip,
                                                                rotate=rotate)
         else:
-            img = img.resize(resize_dims)
-            post_rot *= resize
+            img = img.resize((self.final_w, self.final_h))
+            post_rot[0, 0], post_rot[1, 1] = self.final_w / self.org_w, self.final_h / self.org_h
             post_tran2 = post_tran
             post_rot2 = post_rot
 
@@ -302,14 +301,14 @@ class VodData(Dataset):
 
     def __getitem__(self, index):
         frame_number = self.frame_numbers[index]
-        out_dict = {"image": None,
-                    "radar_features": None,
-                    "extrinsic": None,
-                    "intrinsic": None,
-                    "ground_truth": None,
-                    "post_trans": None,
-                    "post_rot": None,
-                    "img_name": None}
+        out_dict = {"image": 0,
+                    "radar_features": 0,
+                    "extrinsic": 0,
+                    "intrinsic": 0,
+                    "ground_truth": 0,
+                    "post_trans": 0,
+                    "post_rot": 0,
+                    "img_name": 0}
         if self.useRadar:
             out_dict['radar_features'] = self.get_radar_data(frame_number)
         if self.useCamera:
@@ -330,7 +329,7 @@ class VodData(Dataset):
 
 
 def dataloaders(path, grid, final_hw, org_hw, nworkers, batch_size, data_aug_conf, radar_augmentation=False,
-                useRadar=True, useCamera=True, ):
+                useRadar=True, useCamera=True):
     # vod_path, is_train, grid_conf, final_hw, org_hw, data_aug_conf
     train_data = VodData(path, is_train=True, grid_conf=grid, final_hw=final_hw, org_hw=org_hw,
                          data_aug_conf=data_aug_conf, radar_augmentation=radar_augmentation, useRadar=useRadar,
