@@ -167,7 +167,7 @@ class CrossViewTransformer(nn.Module):
         key = self.key_conv(x)
         value = self.value_conv(x_backward)  # B C H W
         value = value.view(B, C, -1)
-        #B N C and B C N
+        # B N C and B C N
         att_score = torch.bmm(key.view(B, self.in_dim // 8, -1).permute(0, 2, 1),
                               query.view(B, self.in_dim // 8, -1))  # B N N
         max_value, idx = att_score.max(dim=-1)
@@ -185,13 +185,14 @@ class CrossViewTransformer(nn.Module):
 
 
 class PYVAModel(nn.Module):
-    def __init__(self, feature_size: list, bev_size: list, encoder_chn=128, upper_chn=64, out_chn=1, radar_chn=0):
+    def __init__(self, feature_size: list, bev_size: list, encoder_chn=128, upper_chn=64, out_chn=1, radar_chn=0,
+                 up_times=1):
         super(PYVAModel, self).__init__()
         self.encoder = Encoder(out_channel=encoder_chn)
 
         self.cvt = CVT(input_dim=[feature_size[0], feature_size[1]], dim=[bev_size[0], bev_size[1]])
         self.attention = CrossViewTransformer(in_dim=encoder_chn)
-        self.upper = Upper(encoder_chn, upper_chn, up_times=3)
+        self.upper = Upper(encoder_chn, upper_chn, up_times=up_times)
         self.decoder = BevDecode(inC=upper_chn + radar_chn, outC=out_chn)
 
     def forward(self, x, radar=None):
@@ -200,10 +201,14 @@ class PYVAModel(nn.Module):
         x_org = x
         x = self.attention(x, x_forward, x_backward)
         x = self.upper(x)
+        x_forward = self.upper(x_forward)
         if radar is not None:
             x = torch.cat((x, radar), dim=1)
+            x_forward = torch.cat((x_forward, radar), dim=1)
         x = self.decoder(x)
-        return x, x_org, x_backward
+        x_forward = self.decoder(x_forward)
+
+        return x, x_org, x_backward, x_forward
 
 
 # class Discriminator(nn.Module):

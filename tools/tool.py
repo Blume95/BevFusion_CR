@@ -84,6 +84,48 @@ def get_val_info(model, val_loader, loss_fn, device, use_tqdm=True):
         }
 
 
+def get_val_cvt(model, val_loader, loss_fn, device, use_tqdm=True):
+    model.eval()
+    print('running eval...')
+    total_intersect = 0
+    total_union = 0
+    total_loss = 0.0
+    total_cycle_loss = 0.0
+    total_bce_loss = 0.0
+    total_bce_forward_loss = 0.0
+    loader = tqdm(val_loader) if use_tqdm else val_loader
+    with torch.no_grad():
+        for batch in loader:
+            img = batch['image'].to(device)
+            radar_bev = batch['radar_features']
+            gt = batch['ground_truth'].to(device)
+
+            # loss
+            if radar_bev[0] == 0:
+                pred, x, x_backward, pred_forward = model(img)
+            else:
+                pred, x, x_backward, pred_forward = model(img, radar_bev.to(device))
+            loss, loss_cycle, loss_bce, loss_bce_forward = loss_fn(pred, gt, x, x_backward, pred_forward)
+
+            total_loss += loss
+            total_bce_loss += loss_bce
+            total_cycle_loss += loss_cycle
+            total_bce_forward_loss += loss_bce_forward
+
+            # foreground iou
+            pred_mask = (pred > 0)
+            tgt = gt.bool()
+            total_intersect += (pred_mask & tgt).sum().float().item()
+            total_union += (pred_mask | tgt).sum().float().item()
+        return {
+            'iou': total_intersect / total_union,
+            'loss': total_loss / len(val_loader.dataset),
+            'loss_cyc': total_cycle_loss / len(val_loader.dataset),
+            'loss_bce': total_bce_loss / len(val_loader.dataset),
+            'loss_bce_forward': total_bce_forward_loss / len(val_loader.dataset),
+        }
+
+
 def ddp_setup(rank: int, world_size: int):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'

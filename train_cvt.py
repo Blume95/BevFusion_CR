@@ -4,12 +4,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import destroy_process_group
 import os
 from datetime import datetime
-from tools.tool import ddp_setup
+from tools.tool import ddp_setup, get_val_cvt
 from data.vod import dataloaders
 from model.PYVA import PYVAModel
 from torch.utils.tensorboard import SummaryWriter
 import pickle
 from tools.loss import computeLoss
+import math
 
 datetime_now = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
 
@@ -41,9 +42,14 @@ def train(rank: int,
     train_loader, val_loader = dataloaders(path, grid, final_hw=final_hw, org_hw=org_hw, nworkers=workers,
                                            batch_size=batch_size, data_aug_conf=None, useRadar=use_radar,
                                            useCamera=use_Camera)
+    feature_down_factor = 32 # based on the image encoder
+    bev_down_factor = 32 # the lower the more compute resource
+    up_times = int(math.log2(bev_down_factor))
+    assert 2 ** up_times == bev_down_factor
 
-    model = PYVAModel(feature_size=[int(final_hw[0] / 32), int(final_hw[1] / 32)],
-                      bev_size=[bev_size[0] / 8, bev_size[1] / 8], radar_chn=radar_channel)
+    model = PYVAModel(feature_size=[int(final_hw[0] / feature_down_factor), int(final_hw[1] / feature_down_factor)],
+                      bev_size=[bev_size[0] / bev_down_factor, bev_size[1] / bev_down_factor], radar_chn=radar_channel,
+                      up_times=up_times, out_chn=out_channel)
     model.to(rank)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank], find_unused_parameters=True)
@@ -79,16 +85,19 @@ def train(rank: int,
             gt = out_dict['ground_truth'].to(rank)
 
             if radar_bev[0] == 0:
-                pred, x, x_backward = model(img)
+                pred, x, x_backward, pred_forward = model(img)
             else:
-                pred, x, x_backward = model(img, radar_bev.to(rank))
-            loss, loss_cycle, loss_bce = loss_fn(pred, gt, x, x_backward)
+                pred, x, x_backward, pred_forward = model(img, radar_bev.to(rank))
+            loss, loss_cycle, loss_bce, loss_bce_forward = loss_fn(pred, gt, x, x_backward,pred_forward)
             loss.backward()
             opt.step()
             counter += 1
 
             if counter % 10 == 0 and rank == 0:
                 writer.add_scalar('train/loss', loss, counter)
+                writer.add_scalar('train/loss_cycle', loss_cycle, counter)
+                writer.add_scalar('train/loss_bce', loss_bce, counter)
+                writer.add_scalar('train/loss_bce_forward', loss_bce_forward, counter)
 
             if counter % 50 == 0 and rank == 0:
                 pred_mask = (pred > 0)
@@ -98,17 +107,21 @@ def train(rank: int,
 
                 writer.add_scalar('train/iou', total_intersect / total_union, counter)
 
-            # if counter % val_step == 0 and rank == 0:
-            #     val_info = get_val_info(model, val_loader, loss_fn, device)
-            #     print('VAL', val_info)
-            #     writer.add_scalar('val/loss', val_info['loss'], counter)
-            #     writer.add_scalar('val/iou', val_info['iou'], counter)
-            #
-            # if rank == 0 and counter % val_step == 0:
-            #     mname = os.path.join(weights_dir, "model_{}.pt".format(counter))
-            #     print('saving', mname)
-            #     torch.save(model.module.state_dict(), mname)
-            #     model.train()
+            if counter % val_step == 0 and rank == 0:
+                val_info = get_val_cvt(model, val_loader, loss_fn, rank)
+                print('VAL', val_info)
+                writer.add_scalar('val/loss', val_info['loss'], counter)
+                writer.add_scalar('val/iou', val_info['iou'], counter)
+                writer.add_scalar('val/loss_bce', val_info['loss_bce'], counter)
+                writer.add_scalar('val/loss_cyc', val_info['loss_cyc'], counter)
+                writer.add_scalar('val/loss_bce_forward', val_info['loss_bce_forward'], counter)
+
+            if rank == 0 and counter % val_step == 0:
+                mname = os.path.join(weights_dir, "model_{}.pt".format(counter))
+                print('saving', mname)
+                torch.save(model.module.state_dict(), mname)
+                model.train()
+    destroy_process_group()
 
 
 def main():
@@ -141,12 +154,12 @@ def main():
 
     training_parameters = {
         "out_channel": out_channel,
-        "batch_size": 2,
+        "batch_size": 24,
         "workers": 4,
         "lr": 1e-4,
         "weight_decay": 1e-5,
         "nepochs": 200,
-        "val_step": 300,
+        "val_step": 200,
         "grid": grid,
         "final_hw": final_hw,
         "org_hw": org_hw,
